@@ -1,28 +1,56 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <ArduinoJson.h>
-#include "voltage_measurement.h"
+#include <Wire.h>
+#include <Adafruit_ADS1X15.h>
+// #include "voltage_measurement.h" // Make sure this file exists
 
 // WiFi credentials
 const char* ssid = "YOUR_WIFI_SSID";
 const char* password = "YOUR_WIFI_PASSWORD";
 
 WebServer server(80);
-VoltageMeasurement voltmeter;
+Adafruit_ADS1115 ads; // Using ADS1115 directly for now
+// VoltageMeasurement voltmeter; // Uncomment if you have the custom class
 
 // Oscilloscope settings
 const int BUFFER_SIZE = 500;
 float voltageBuffer[BUFFER_SIZE];
 int bufferIndex = 0;
 unsigned long lastSampleTime = 0;
-int sampleRate = 1000; // samples per second (adjustable)
+int sampleRate = 2000; // samples per second
 bool isRunning = true;
+bool triggerMode = false;
+float triggerLevel = 2.5; // 2.5V trigger level
+bool triggered = false;
+
+// Voltage measurement functions (replace with your custom class if available)
+float readVoltage() {
+  int16_t adc = ads.readADC_SingleEnded(0);
+  float voltage = ads.computeVolts(adc);
+  return voltage * 10.0; // Adjust multiplier based on your voltage divider
+}
+
+int16_t getAnalogValue() {
+  return ads.readADC_SingleEnded(0);
+}
+
+float getCalibrationFactor() {
+  return 10.0; // Return your calibration factor
+}
 
 void setup() {
   Serial.begin(115200);
   
+  // Initialize ADS1115
+  if (!ads.begin()) {
+    Serial.println("Failed to initialize ADS1115!");
+    while (1);
+  }
+  ads.setGain(GAIN_ONE); // 1x gain +/- 4.096V
+  
   // Initialize voltage measurement
-  voltmeter.begin();
+  // voltmeter.begin(); // Uncomment if using custom class
   
   // Connect to WiFi
   WiFi.begin(ssid, password);
@@ -38,8 +66,12 @@ void setup() {
   server.on("/", handleRoot);
   server.on("/data", handleData);
   server.on("/control", HTTP_POST, handleControl);
-  server.begin();
+  server.on("/status", handleStatus);
   
+  // Enable CORS for all routes
+  server.enableCORS(true);
+  
+  server.begin();
   Serial.println("Web server started");
 }
 
@@ -48,10 +80,27 @@ void loop() {
   
   // Sample voltage at specified rate
   if (isRunning && (micros() - lastSampleTime) >= (1000000 / sampleRate)) {
-    float voltage = voltmeter.readVoltage();
+    float voltage = readVoltage(); // voltmeter.readVoltage();
+    
+    // Simple trigger logic
+    if (triggerMode && !triggered) {
+      static float lastVoltage = 0;
+      if (lastVoltage < triggerLevel && voltage >= triggerLevel) {
+        triggered = true;
+        bufferIndex = 0; // Reset buffer on trigger
+      }
+      lastVoltage = voltage;
+      if (!triggered) return; // Skip sampling until triggered
+    }
+    
     voltageBuffer[bufferIndex] = voltage;
     bufferIndex = (bufferIndex + 1) % BUFFER_SIZE;
     lastSampleTime = micros();
+    
+    // Reset trigger after buffer is full
+    if (triggerMode && bufferIndex == 0 && triggered) {
+      triggered = false;
+    }
   }
 }
 
@@ -93,6 +142,7 @@ void handleRoot() {
             display: flex;
             flex-direction: column;
             gap: 5px;
+            min-width: 120px;
         }
         label { 
             font-weight: bold; 
@@ -104,6 +154,14 @@ void handleRoot() {
             border: 1px solid #555; 
             padding: 8px 12px; 
             border-radius: 5px; 
+        }
+        input[type="range"] {
+            padding: 4px;
+        }
+        #triggerValue {
+            font-size: 0.9em;
+            color: #00ff00;
+            text-align: center;
         }
         button { 
             cursor: pointer; 
@@ -154,17 +212,17 @@ void handleRoot() {
 </head>
 <body>
     <div class="container">
-        <h1>🔬 Web Oscilloscope</h1>
+        <h1>Web Oscilloscope</h1>
         
         <div class="controls">
             <div class="control-group">
                 <label>Sample Rate:</label>
                 <select id="sampleRate">
-                    <option value="100">100 Hz</option>
                     <option value="500">500 Hz</option>
-                    <option value="1000" selected>1000 Hz</option>
-                    <option value="2000">2000 Hz</option>
-                    <option value="5000">5000 Hz</option>
+                    <option value="1000">1000 Hz</option>
+                    <option value="2000" selected>2000 Hz</option>
+                    <option value="4000">4000 Hz</option>
+                    <option value="8000">8000 Hz (Max)</option>
                 </select>
             </div>
             
@@ -190,8 +248,22 @@ void handleRoot() {
                 </select>
             </div>
             
-            <button id="startStop" class="start">▶ Start</button>
-            <button id="trigger">⚡ Single</button>
+            <div class="control-group">
+                <label>Trigger:</label>
+                <select id="triggerMode">
+                    <option value="auto" selected>Auto</option>
+                    <option value="normal">Normal</option>
+                </select>
+            </div>
+            
+            <div class="control-group">
+                <label>Trigger Level:</label>
+                <input type="range" id="triggerLevel" min="0" max="45" value="2.5" step="0.1">
+                <span id="triggerValue">2.5V</span>
+            </div>
+            
+            <button id="startStop" class="start">Start</button>
+            <button id="trigger">Single</button>
         </div>
         
         <div class="scope-container">
@@ -215,6 +287,14 @@ void handleRoot() {
                 <div class="info-label">Waveform Type</div>
                 <div class="info-value" id="waveformType">Analyzing...</div>
             </div>
+            <div class="info-item">
+                <div class="info-label">ADC Reading</div>
+                <div class="info-value" id="adcReading">0</div>
+            </div>
+            <div class="info-item">
+                <div class="info-label">Calibration Factor</div>
+                <div class="info-value" id="calFactor">1.000</div>
+            </div>
         </div>
     </div>
 
@@ -234,7 +314,7 @@ void handleRoot() {
             ctx.strokeStyle = '#003300';
             ctx.lineWidth = 1;
             
-            // Vertical grid lines
+            // Vertical grid lines (time divisions)
             for (let x = 0; x <= canvas.width; x += canvas.width / 10) {
                 ctx.beginPath();
                 ctx.moveTo(x, 0);
@@ -242,7 +322,7 @@ void handleRoot() {
                 ctx.stroke();
             }
             
-            // Horizontal grid lines
+            // Horizontal grid lines (voltage divisions)
             for (let y = 0; y <= canvas.height; y += canvas.height / 8) {
                 ctx.beginPath();
                 ctx.moveTo(0, y);
@@ -250,13 +330,26 @@ void handleRoot() {
                 ctx.stroke();
             }
             
-            // Center line
+            // Center line (0V reference)
             ctx.strokeStyle = '#006600';
             ctx.lineWidth = 2;
             ctx.beginPath();
             ctx.moveTo(0, canvas.height / 2);
             ctx.lineTo(canvas.width, canvas.height / 2);
             ctx.stroke();
+            
+            // Trigger level line
+            if (document.getElementById('triggerMode').value === 'normal') {
+                ctx.strokeStyle = '#ffff00';
+                ctx.lineWidth = 1;
+                ctx.setLineDash([5, 5]);
+                let triggerY = canvas.height / 2 - (parseFloat(document.getElementById('triggerLevel').value) / voltageScale) * (canvas.height / 8);
+                ctx.beginPath();
+                ctx.moveTo(0, triggerY);
+                ctx.lineTo(canvas.width, triggerY);
+                ctx.stroke();
+                ctx.setLineDash([]);
+            }
         }
         
         function drawWaveform() {
@@ -312,43 +405,53 @@ void handleRoot() {
             let range = max - min;
             if (range < 0.1) return 'DC / Flat';
             
-            // Check for PWM (square wave)
+            // Check for PWM (square wave) - very common in embedded systems
             let highCount = 0;
             let lowCount = 0;
+            let midCount = 0;
             let midpoint = (max + min) / 2;
+            let threshold = range * 0.2; // 20% threshold
             
             for (let val of signal) {
-                if (val > midpoint + range * 0.3) highCount++;
-                else if (val < midpoint - range * 0.3) lowCount++;
+                if (val > midpoint + threshold) highCount++;
+                else if (val < midpoint - threshold) lowCount++;
+                else midCount++;
             }
             
-            let pwmRatio = Math.max(highCount, lowCount) / signal.length;
-            if (pwmRatio > 0.6) return 'PWM / Square';
+            let extremeRatio = (highCount + lowCount) / signal.length;
+            if (extremeRatio > 0.8) {
+                let dutyCycle = (highCount / (highCount + lowCount) * 100).toFixed(0);
+                return `PWM (${dutyCycle}% duty)`;
+            }
             
             // Check for sine wave
-            let sineMatch = 0;
-            for (let i = 0; i < Math.min(signal.length, 100); i++) {
-                let expected = midpoint + (range / 2) * Math.sin((i / signal.length) * 2 * Math.PI);
-                let diff = Math.abs(signal[i] - expected);
-                if (diff < range * 0.2) sineMatch++;
+            let sineCorrelation = 0;
+            let samples = Math.min(signal.length, 100);
+            for (let i = 0; i < samples; i++) {
+                let phase = (i / samples) * 2 * Math.PI;
+                let expected = midpoint + (range / 2) * Math.sin(phase);
+                let error = Math.abs(signal[i] - expected) / range;
+                if (error < 0.3) sineCorrelation++;
             }
             
-            if (sineMatch > signal.length * 0.6) return 'Sine Wave';
+            if (sineCorrelation / samples > 0.7) return 'Sine Wave';
             
-            // Check for triangle wave
-            let isIncreasing = false;
-            let changeCount = 0;
-            for (let i = 1; i < signal.length; i++) {
-                let currentIncreasing = signal[i] > signal[i-1];
-                if (currentIncreasing !== isIncreasing) {
-                    changeCount++;
-                    isIncreasing = currentIncreasing;
-                }
+            // Check for triangle/sawtooth
+            let slopes = [];
+            for (let i = 1; i < Math.min(signal.length, 50); i++) {
+                slopes.push(signal[i] - signal[i-1]);
+            }
+            let avgSlope = slopes.reduce((a, b) => a + Math.abs(b), 0) / slopes.length;
+            let slopeVariance = slopes.reduce((a, b) => a + Math.pow(Math.abs(b) - avgSlope, 2), 0) / slopes.length;
+            
+            if (slopeVariance < avgSlope * 0.5 && avgSlope > range * 0.01) {
+                return 'Triangle/Ramp';
             }
             
-            if (changeCount < 10 && changeCount > 2) return 'Triangle Wave';
+            // Check for noise/random
+            if (midCount > signal.length * 0.6) return 'Noise/Random';
             
-            return 'Complex / Other';
+            return 'Complex/Other';
         }
         
         function updateDisplay() {
@@ -368,6 +471,15 @@ void handleRoot() {
                     updateDisplay();
                 })
                 .catch(error => console.error('Error fetching data:', error));
+                
+            // Also fetch status info
+            fetch('/status')
+                .then(response => response.json())
+                .then(status => {
+                    document.getElementById('adcReading').textContent = status.adc || '0';
+                    document.getElementById('calFactor').textContent = (status.calibration || 1).toFixed(3);
+                })
+                .catch(error => console.error('Error fetching status:', error));
         }
         
         // Controls
@@ -404,6 +516,24 @@ void handleRoot() {
             updateDisplay();
         });
         
+        document.getElementById('triggerLevel').addEventListener('input', function() {
+            document.getElementById('triggerValue').textContent = this.value + 'V';
+            updateDisplay();
+        });
+        
+        document.getElementById('triggerMode').addEventListener('change', function() {
+            let isTriggerMode = this.value === 'normal';
+            fetch('/control', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    triggerMode: isTriggerMode,
+                    triggerLevel: parseFloat(document.getElementById('triggerLevel').value)
+                })
+            });
+            updateDisplay();
+        });
+        
         // Start fetching data
         setInterval(fetchData, 50); // Update display at 20 FPS
     </script>
@@ -429,6 +559,26 @@ void handleData() {
   server.send(200, "application/json", response);
 }
 
+void handleStatus() {
+  DynamicJsonDocument doc(1024);
+  
+  // Get current readings for display
+  float currentVoltage = readVoltage(); // voltmeter.readVoltage();
+  int16_t adcValue = getAnalogValue(); // voltmeter.getAnalogValue();
+  float calFactor = getCalibrationFactor(); // voltmeter.getCalibrationFactor();
+  
+  doc["voltage"] = currentVoltage;
+  doc["adc"] = adcValue;
+  doc["calibration"] = calFactor;
+  doc["sampleRate"] = sampleRate;
+  doc["triggerMode"] = triggerMode;
+  doc["triggerLevel"] = triggerLevel;
+  
+  String response;
+  serializeJson(doc, response);
+  server.send(200, "application/json", response);
+}
+
 void handleControl() {
   if (server.hasArg("plain")) {
     DynamicJsonDocument doc(1024);
@@ -438,6 +588,19 @@ void handleControl() {
       sampleRate = doc["sampleRate"];
       Serial.print("Sample rate changed to: ");
       Serial.println(sampleRate);
+    }
+    
+    if (doc.containsKey("triggerMode")) {
+      triggerMode = doc["triggerMode"];
+      triggered = false; // Reset trigger state
+      Serial.print("Trigger mode: ");
+      Serial.println(triggerMode ? "Normal" : "Auto");
+    }
+    
+    if (doc.containsKey("triggerLevel")) {
+      triggerLevel = doc["triggerLevel"];
+      Serial.print("Trigger level: ");
+      Serial.println(triggerLevel);
     }
   }
   
