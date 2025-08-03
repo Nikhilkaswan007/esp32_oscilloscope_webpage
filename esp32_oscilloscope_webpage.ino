@@ -24,6 +24,11 @@ bool triggerMode = false;
 float triggerLevel = 2.5; // 2.5V trigger level
 bool triggered = false;
 
+// Auto-scaling variables
+bool autoTimeScale = true;
+float detectedFrequency = 0;
+float lastTimeScale = 0.5;
+
 // Voltage measurement functions (replace with your custom class if available)
 float readVoltage() {
   int16_t adc = ads.readADC_SingleEnded(0);
@@ -158,9 +163,18 @@ void handleRoot() {
         input[type="range"] {
             padding: 4px;
         }
+        input[type="checkbox"] {
+            transform: scale(1.2);
+            margin: 0 5px;
+        }
         #triggerValue {
             font-size: 0.9em;
             color: #00ff00;
+            text-align: center;
+        }
+        .auto-indicator {
+            font-size: 0.8em;
+            color: #ffaa00;
             text-align: center;
         }
         button { 
@@ -208,6 +222,9 @@ void handleRoot() {
             font-weight: bold; 
             color: #00ff00;
         }
+        .auto-enabled {
+            color: #ffaa00 !important;
+        }
     </style>
 </head>
 <body>
@@ -229,17 +246,28 @@ void handleRoot() {
             <div class="control-group">
                 <label>Time Scale:</label>
                 <select id="timeScale">
+                    <option value="2">2 sec</option>
                     <option value="1">1 sec</option>
                     <option value="0.5" selected>0.5 sec</option>
                     <option value="0.2">0.2 sec</option>
                     <option value="0.1">0.1 sec</option>
                     <option value="0.05">0.05 sec</option>
+                    <option value="0.02">0.02 sec</option>
+                    <option value="0.01">0.01 sec</option>
+                    <option value="0.005">0.005 sec</option>
+                    <option value="0.002">0.002 sec</option>
+                    <option value="0.001">0.001 sec</option>
                 </select>
+                <div class="auto-indicator">
+                    <input type="checkbox" id="autoTimeScale" checked>
+                    <label for="autoTimeScale">Auto Scale</label>
+                </div>
             </div>
             
             <div class="control-group">
                 <label>Voltage Scale:</label>
                 <select id="voltageScale">
+                    <option value="0.5">0.5V/div</option>
                     <option value="1">1V/div</option>
                     <option value="2">2V/div</option>
                     <option value="5" selected>5V/div</option>
@@ -292,8 +320,8 @@ void handleRoot() {
                 <div class="info-value" id="adcReading">0</div>
             </div>
             <div class="info-item">
-                <div class="info-label">Calibration Factor</div>
-                <div class="info-value" id="calFactor">1.000</div>
+                <div class="info-label">Effective Time Scale</div>
+                <div class="info-value" id="effectiveTimeScale">0.5 sec</div>
             </div>
         </div>
     </div>
@@ -305,10 +333,78 @@ void handleRoot() {
         let isRunning = true;
         let timeScale = 0.5;
         let voltageScale = 5;
+        let autoTimeScale = true;
+        let lastFrequency = 0;
+        let sampleRate = 2000;
         
         // Set canvas resolution
         canvas.width = 800;
         canvas.height = 400;
+        
+        function calculateOptimalTimeScale(frequency) {
+            if (frequency <= 0) return timeScale;
+            
+            // Target: show 2-5 complete cycles on screen
+            let cyclesPerSecond = frequency;
+            let targetCycles = 3; // Show 3 complete cycles
+            let optimalTimeScale = targetCycles / cyclesPerSecond;
+            
+            // Round to standard oscilloscope time divisions
+            let standardTimeScales = [
+                0.001, 0.002, 0.005, 
+                0.01, 0.02, 0.05, 
+                0.1, 0.2, 0.5, 
+                1, 2, 5
+            ];
+            
+            // Find the closest standard time scale
+            let closest = standardTimeScales[0];
+            let minDiff = Math.abs(optimalTimeScale - closest);
+            
+            for (let scale of standardTimeScales) {
+                let diff = Math.abs(optimalTimeScale - scale);
+                if (diff < minDiff) {
+                    minDiff = diff;
+                    closest = scale;
+                }
+            }
+            
+            // Prefer slightly longer time scales for better visibility
+            let index = standardTimeScales.indexOf(closest);
+            if (index < standardTimeScales.length - 1 && 
+                standardTimeScales[index + 1] / optimalTimeScale < 2) {
+                closest = standardTimeScales[index + 1];
+            }
+            
+            return closest;
+        }
+        
+        function updateTimeScaleDisplay(effectiveTimeScale) {
+            document.getElementById('effectiveTimeScale').textContent = effectiveTimeScale.toFixed(3) + ' sec';
+            
+            // Update the dropdown to show current effective time scale if auto is enabled
+            if (autoTimeScale) {
+                let timeScaleSelect = document.getElementById('timeScale');
+                timeScaleSelect.style.color = '#ffaa00'; // Orange to indicate auto mode
+                
+                // Find closest option
+                let options = Array.from(timeScaleSelect.options);
+                let closest = options[0];
+                let minDiff = Math.abs(parseFloat(closest.value) - effectiveTimeScale);
+                
+                for (let option of options) {
+                    let diff = Math.abs(parseFloat(option.value) - effectiveTimeScale);
+                    if (diff < minDiff) {
+                        minDiff = diff;
+                        closest = option;
+                    }
+                }
+                
+                timeScaleSelect.value = closest.value;
+            } else {
+                document.getElementById('timeScale').style.color = '#fff';
+            }
+        }
         
         function drawGrid() {
             ctx.strokeStyle = '#003300';
@@ -355,15 +451,28 @@ void handleRoot() {
         function drawWaveform() {
             if (data.length < 2) return;
             
+            // Calculate effective sample rate for current time scale
+            let effectiveTimeScale = autoTimeScale ? calculateOptimalTimeScale(lastFrequency) : timeScale;
+            let totalTime = effectiveTimeScale;
+            let samplesNeeded = Math.floor(totalTime * sampleRate);
+            samplesNeeded = Math.min(samplesNeeded, data.length);
+            
+            // Update display
+            updateTimeScaleDisplay(effectiveTimeScale);
+            
             ctx.strokeStyle = '#00ff00';
             ctx.lineWidth = 2;
             ctx.beginPath();
             
-            for (let i = 0; i < data.length - 1; i++) {
-                let x1 = (i / data.length) * canvas.width;
-                let y1 = canvas.height / 2 - (data[i] / voltageScale) * (canvas.height / 8);
-                let x2 = ((i + 1) / data.length) * canvas.width;
-                let y2 = canvas.height / 2 - (data[i + 1] / voltageScale) * (canvas.height / 8);
+            // Draw only the samples that fit in the current time scale
+            let startIndex = Math.max(0, data.length - samplesNeeded);
+            let displayData = data.slice(startIndex);
+            
+            for (let i = 0; i < displayData.length - 1; i++) {
+                let x1 = (i / (displayData.length - 1)) * canvas.width;
+                let y1 = canvas.height / 2 - (displayData[i] / voltageScale) * (canvas.height / 8);
+                let x2 = ((i + 1) / (displayData.length - 1)) * canvas.width;
+                let y2 = canvas.height / 2 - (displayData[i + 1] / voltageScale) * (canvas.height / 8);
                 
                 if (i === 0) ctx.moveTo(x1, y1);
                 ctx.lineTo(x2, y2);
@@ -382,17 +491,29 @@ void handleRoot() {
             document.getElementById('currentVoltage').textContent = current.toFixed(2) + ' V';
             document.getElementById('peakToPeak').textContent = peakToPeak.toFixed(2) + ' V';
             
-            // Simple frequency detection
+            // Enhanced frequency detection
             let crossings = 0;
             let midpoint = (max + min) / 2;
+            let threshold = peakToPeak * 0.1; // 10% threshold to avoid noise
+            
             for (let i = 1; i < data.length; i++) {
-                if ((data[i-1] < midpoint && data[i] >= midpoint) || 
-                    (data[i-1] > midpoint && data[i] <= midpoint)) {
+                if ((data[i-1] < midpoint - threshold && data[i] >= midpoint + threshold) || 
+                    (data[i-1] > midpoint + threshold && data[i] <= midpoint - threshold)) {
                     crossings++;
                 }
             }
-            let frequency = (crossings / 2) / timeScale;
-            document.getElementById('frequency').textContent = frequency > 0 ? frequency.toFixed(1) + ' Hz' : '-- Hz';
+            
+            // Calculate frequency based on current effective time scale
+            let effectiveTimeScale = autoTimeScale ? calculateOptimalTimeScale(lastFrequency) : timeScale;
+            let totalTime = (data.length / sampleRate);
+            let frequency = (crossings / 2) / totalTime;
+            
+            if (frequency > 0 && frequency < sampleRate / 2) { // Nyquist limit
+                lastFrequency = frequency;
+                document.getElementById('frequency').textContent = frequency.toFixed(1) + ' Hz';
+            } else {
+                document.getElementById('frequency').textContent = '-- Hz';
+            }
             
             // Waveform type detection
             let waveformType = detectWaveformType(data, min, max);
@@ -477,7 +598,7 @@ void handleRoot() {
                 .then(response => response.json())
                 .then(status => {
                     document.getElementById('adcReading').textContent = status.adc || '0';
-                    document.getElementById('calFactor').textContent = (status.calibration || 1).toFixed(3);
+                    sampleRate = status.sampleRate || 2000;
                 })
                 .catch(error => console.error('Error fetching status:', error));
         }
@@ -499,6 +620,7 @@ void handleRoot() {
         
         document.getElementById('sampleRate').addEventListener('change', function() {
             let rate = parseInt(this.value);
+            sampleRate = rate;
             fetch('/control', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
@@ -508,6 +630,16 @@ void handleRoot() {
         
         document.getElementById('timeScale').addEventListener('change', function() {
             timeScale = parseFloat(this.value);
+            if (!autoTimeScale) {
+                updateDisplay();
+            }
+        });
+        
+        document.getElementById('autoTimeScale').addEventListener('change', function() {
+            autoTimeScale = this.checked;
+            if (!autoTimeScale) {
+                timeScale = parseFloat(document.getElementById('timeScale').value);
+            }
             updateDisplay();
         });
         
